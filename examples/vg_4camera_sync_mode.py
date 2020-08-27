@@ -8,9 +8,10 @@ import pdb
 import matplotlib.pyplot as plt
 import json
 
-from synchronous_mode import CarlaSyncMode, draw_image, get_font, should_quit
-from vg_snapshot_utils import process_world_snapshot
+from agents.navigation.basic_agent import BasicAgent  # pylint: disable=import-error
 
+from synchronous_mode import CarlaSyncMode
+from vg_snapshot_utils import process_world_snapshot
 
 def create_cameras_from_config(world, vehicle, bp_library, camera_config):
     sensor_location = carla.Location(x=camera_config['x'], y=camera_config['y'],
@@ -28,18 +29,15 @@ def create_cameras_from_config(world, vehicle, bp_library, camera_config):
         bp.set_attribute('image_size_x', str(camera_config['width']))
         bp.set_attribute('image_size_y', str(camera_config['height']))
         bp.set_attribute('fov', str(camera_config['fov']))
+        bp.set_attribute('role_name', str(camera_config['name']))
 
     return [world.spawn_actor(bp, sensor_transform, attach_to=vehicle) for bp in [bp_rgb, bp_seg, bp_depth]]
 
-
-
 def main_autopilot(args, max_frames=1000):
+    print('Hit the Escape Key on the OpenCV window to exit.')
     actor_list = []
     camera_list = []
-    pygame.init()
-
-    clock = pygame.time.Clock()
-
+    
     client = carla.Client(args.host, args.port)
     client.set_timeout(2.0)
 
@@ -51,56 +49,51 @@ def main_autopilot(args, max_frames=1000):
         waypoint = m.get_waypoint(start_pose.location)
 
         bp_library = world.get_blueprint_library()
+        bp_vehicle = random.choice(bp_library.filter(args.filter))
+        bp_vehicle.set_attribute('role_name', 'hero')
 
-        vehicle = world.spawn_actor(
-            random.choice(bp_library.filter(args.filter)),
-            start_pose)
+        vehicle = world.spawn_actor(bp_vehicle, start_pose)
         vehicle.set_autopilot(True)
         ego_id = vehicle.id
         actor_list.append(vehicle)
 
-
-        # Spectator
-        spectator = world.get_spectator()
-
-        # Center, Left, # Right
+        # Camera parameter settings.
         camera_configs = [ \
          {'x':0.7, 'y':0.0, 'z':1.6, \
          'roll':0.0, 'pitch':0.0, 'yaw':0.0, \
-         'width':960, 'height': 720, 'fov':120},
+         'width':960, 'height': 720, 'fov':120, \
+         'name':'center'},
          {'x':-0.7, 'y':-0.4, 'z':1.6, \
          'roll':0.0, 'pitch':0.0, 'yaw':225.0, \
-         'width':960, 'height': 720, 'fov':120},
+         'width':960, 'height': 720, 'fov':120, \
+         'name': 'left'},
          {'x':-0.7, 'y':0.4, 'z':1.6, \
          'roll':0.0, 'pitch':0.0, 'yaw':135.0, \
-         'width':960, 'height': 720, 'fov':120},
+         'width':960, 'height': 720, 'fov':120, \
+         'name': 'right'},
          {'x':0.7, 'y':0.0, 'z':1.6, \
          'roll':0.0, 'pitch':0.0, 'yaw':0.0, \
-         'width':960, 'height': 720, 'fov':60},
+         'width':960, 'height': 720, 'fov':60, \
+         'name': 'far'},
         ]
 
+        # Create all cameras and add to actor/camera lists.
         cam_center, seg_center, depth_center = create_cameras_from_config(world, vehicle, bp_library, camera_configs[0])
         cam_left, seg_left, depth_left       = create_cameras_from_config(world, vehicle, bp_library, camera_configs[1])
         cam_right, seg_right, depth_right    = create_cameras_from_config(world, vehicle, bp_library, camera_configs[2])
         cam_far, seg_far, depth_far          = create_cameras_from_config(world, vehicle, bp_library, camera_configs[3])
         
-
         for camera_id in ['center', 'left', 'right', 'far']:
             for camera_type in ['cam', 'seg', 'depth']:
 
                 camera_name = camera_type + '_' + camera_id
                 camera_list.append(locals()[camera_name])
-
         actor_list.extend(camera_list)
         
         # Create a synchronous mode context.
         num_frames_saved = 0
         with CarlaSyncMode(world, *camera_list, fps=args.fps) as sync_mode:
             while True:
-                if should_quit() or num_frames_saved >= max_frames:
-                    return
-                clock.tick()
-
                 # Advance the simulation and wait for the data.
                 snapshot, \
                 image_center, image_center_seg, image_center_depth, \
@@ -120,56 +113,16 @@ def main_autopilot(args, max_frames=1000):
 
                 fps = round(1.0 / snapshot.timestamp.delta_seconds)
 
-                mosaic_array = np.zeros((1080, 1920, 3), dtype=np.uint8)
                 
-                # actors = world.get_actors()
-
-                # waypoint_tuple_list = world.get_map().get_topology()
-                # for (pt1, pt2) in waypoint_tuple_list:
-                #     start = [pt1.transform.location.x, pt1.transform.location.y]
-                #     end   = [pt2.transform.location.x, pt2.transform.location.y]
-                #     plt.plot(start[0], start[1], 'rx')
-                #     plt.plot(end[0], end[1], 'bx')
-                #     plt.plot([start[0], end[0]], [start[1], end[1]], 'k')
-
-                # # for actor in actors:
-                #     loc = actor.get_location()
-
-                #     if actor.type_id == 'spectator':
-                #         pass
-                #     if actor.type_id == 'vehicle':
-                #         plt.plot(loc.x, loc.y, 'c*')
-                #     elif actor.type_id == 'traffic.unknown':
-                #         plt.plot(loc.x, loc.y, 'm+')
-                #     elif actor.type_id == 'traffic.stop':
-                #         plt.plot(loc.x, loc.y, 'm*')
-                #     elif 'speed_limit' in actor.type_id:
-                #         plt.plot(loc.x, loc.y, 'md')
-                #     elif actor.type_id == 'traffic.traffic_light':
-                #         if actor.state == carla.TrafficLightState.Green:
-                #             color = 'g'
-                #         elif actor.state == carla.TrafficLightState.Red:
-                #             color = 'r'
-                #         elif actor.state == carla.TrafficLightState.Yellow:
-                #             color = 'y'
-                #         plt.plot(loc.x, loc.y, '8', color=color)
-                # plt.show()
-
+                # Write world snapshot to json.
                 snapshot_dict = process_world_snapshot(snapshot, world)
 
                 if num_frames_saved == 1:
                     with open('snapshot_example.json', 'w') as f:
                         f.write(json.dumps(snapshot_dict, indent=4))
 
-                # debug = world.debug
-                
-
-                # for actor_snapshot in snapshot:
-                #     actual_actor = world.get_actor(actor_snapshot.id)
-                #     if actual_actor.type_id == 'traffic.stop':
-                #         debug.draw_box(carla.BoundingBox(actor_snapshot.get_transform().location,carla.Vector3D(0.5,0.5,2)),actor_snapshot.get_transform().rotation, 0.05, carla.Color(255,0,0,0),0)
-
-
+                # Process collecting images.  Visualization for debugging.
+                mosaic_array = np.zeros((1080, 1920, 3), dtype=np.uint8)
                 for col_idx, camera_id in  enumerate(['center', 'left', 'right', 'far']):
                     for row_idx, suffix in enumerate(['', 'seg', 'depth']):
                         img_name = 'image' + '_' + camera_id
@@ -204,38 +157,14 @@ def main_autopilot(args, max_frames=1000):
 
                         mosaic_array[ymin:ymax, xmin:xmax, :] = img_array
 
-                cv2.imshow('mosaic', mosaic_array); cv2.waitKey(1)
+                cv2.imshow('mosaic', mosaic_array)
+                ret = cv2.waitKey(10)
 
+                if num_frames_saved >= max_frames or ret == 27: # Esc
+                    return                
 
-                # Draw the display.
-                # img_array = np.zeros((360, 1440, 3), dtype=np.uint8)
-
-                # center_array = np.frombuffer(image_center.raw_data, dtype=np.uint8)
-                # center_array = np.reshape(center_array, (image_center.height, image_center.width, 4))
-                # center_array = center_array[:, :, :3]
-                # center_array = cv2.resize(center_array, (480, 360))
-
-                # left_array = np.frombuffer(image_left.raw_data, dtype=np.uint8)
-                # left_array = np.reshape(left_array, (image_left.height, image_left.width, 4))
-                # left_array = left_array[:, :, :3]
-                # left_array = cv2.resize(left_array, (480, 360))
-
-                # right_array = np.frombuffer(image_right.raw_data, dtype=np.uint8)
-                # right_array = np.reshape(right_array, (image_right.height, image_right.width, 4))
-                # right_array = right_array[:, :, :3]
-                # right_array = cv2.resize(right_array, (480, 360))
-
-                # far_array = np.frombuffer(image_far.raw_data, dtype=np.uint8)
-                # far_array = np.reshape(far_array, (image_far.height, image_far.width, 4))
-                # far_array = far_array[:, :, :3]
-                # far_array = cv2.resize(far_array, (480, 360))
-
-                # img_array[:, :480, :]    = left_array
-                # img_array[:, 480:960, :] = center_array
-                # img_array[:, 960:, :]    = right_array 
-                # cv2.imshow('fused', img_array);
-                # cv2.imshow('far', far_array)
-                # cv2.waitKey(1)
+    except Exception as e:
+        print(e)
 
     finally:
 
@@ -245,7 +174,6 @@ def main_autopilot(args, max_frames=1000):
 
         cv2.destroyAllWindows()
 
-        pygame.quit()
         print('done.')
 
 
