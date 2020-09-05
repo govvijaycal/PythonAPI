@@ -1,5 +1,6 @@
 import carla
-import pygame
+import os
+import sys
 import random
 import argparse
 import cv2
@@ -7,11 +8,24 @@ import numpy as np
 import pdb
 import matplotlib.pyplot as plt
 import json
+import threading
+import time
 
-from agents.navigation.basic_agent import BasicAgent  # pylint: disable=import-error
-
+import copy
+from queue import Queue
 from synchronous_mode import CarlaSyncMode
 from vg_snapshot_utils import process_world_snapshot
+
+images_queue = Queue() #[carla.Image, saveloc]
+
+def image_saving_thread_function():
+    while True:
+        if images_queue.qsize() > 0:            
+            img, saveloc = images_queue.get()
+            img.save_to_disk(saveloc)
+            images_queue.task_done()
+        else:
+            time.sleep(0.001)
 
 def create_cameras_from_config(world, vehicle, bp_library, camera_config):
     sensor_location = carla.Location(x=camera_config['x'], y=camera_config['y'],
@@ -33,15 +47,17 @@ def create_cameras_from_config(world, vehicle, bp_library, camera_config):
 
     return [world.spawn_actor(bp, sensor_transform, attach_to=vehicle) for bp in [bp_rgb, bp_seg, bp_depth]]
 
-def main_autopilot(args, max_frames=1000):
+def main_autopilot(args, max_frames=50):
     print('Hit the Escape Key on the OpenCV window to exit.')
-    actor_list = []
+    actor_list  = []
     camera_list = []
-    
+
     client = carla.Client(args.host, args.port)
     client.set_timeout(2.0)
 
     world = client.get_world()
+
+    ret = 0
 
     try:
         m = world.get_map()
@@ -77,88 +93,95 @@ def main_autopilot(args, max_frames=1000):
          'name': 'far'},
         ]
 
-        # Create all cameras and add to actor/camera lists.
-        cam_center, seg_center, depth_center = create_cameras_from_config(world, vehicle, bp_library, camera_configs[0])
-        cam_left, seg_left, depth_left       = create_cameras_from_config(world, vehicle, bp_library, camera_configs[1])
-        cam_right, seg_right, depth_right    = create_cameras_from_config(world, vehicle, bp_library, camera_configs[2])
-        cam_far, seg_far, depth_far          = create_cameras_from_config(world, vehicle, bp_library, camera_configs[3])
+        # Create all cameras and add to actor/camera lists.  Also create folders to save to.
+        rgb_center, seg_center, depth_center = create_cameras_from_config(world, vehicle, bp_library, camera_configs[0])
+        rgb_left,   seg_left,   depth_left   = create_cameras_from_config(world, vehicle, bp_library, camera_configs[1])
+        rgb_right,  seg_right,  depth_right  = create_cameras_from_config(world, vehicle, bp_library, camera_configs[2])
+        rgb_far,    seg_far,    depth_far    = create_cameras_from_config(world, vehicle, bp_library, camera_configs[3])
         
         for camera_id in ['center', 'left', 'right', 'far']:
-            for camera_type in ['cam', 'seg', 'depth']:
+            for camera_type in ['rgb', 'seg', 'depth']:
 
-                camera_name = camera_type + '_' + camera_id
+                camera_name = camera_type + '_' + camera_id            
                 camera_list.append(locals()[camera_name])
+                os.makedirs('%s/%s/' % (args.logdir, camera_name), exist_ok=True)
+
         actor_list.extend(camera_list)
-        
+        os.makedirs('%s/snapshot/' % args.logdir, exist_ok=True)        
+
+        # Start Image Saving Thread.  Probably smarter way of doing this, but threads = #image producers works okay.
+        [threading.Thread(target=image_saving_thread_function, daemon=True).start() for x in range(12)]
+
         # Create a synchronous mode context.
         num_frames_saved = 0
         with CarlaSyncMode(world, *camera_list, fps=args.fps) as sync_mode:
             while True:
                 # Advance the simulation and wait for the data.
                 snapshot, \
-                image_center, image_center_seg, image_center_depth, \
-                image_left, image_left_seg, image_left_depth, \
-                image_right, image_right_seg, image_right_depth, \
-                image_far, image_far_seg, image_far_depth = sync_mode.tick(timeout=2.0)
+                image_rgb_center, image_seg_center, image_depth_center, \
+                image_rgb_left,   image_seg_left,   image_depth_left, \
+                image_rgb_right,  image_seg_right,  image_depth_right, \
+                image_rgb_far,    image_seg_far,    image_depth_far = sync_mode.tick(timeout=2.0)
 
                 ego_snap = snapshot.find(ego_id)
                 vel_ego = ego_snap.get_velocity()
                 vel_thresh = 1.0
-                if vel_ego.x**2 + vel_ego.y**2 > vel_thresh:
-                    # image_rgb.save_to_disk('%s/rgb/%08d' % (args.logdir, num_frames_saved))
-                    # image_depth.save_to_disk('%s/depth/%08d' % (args.logdir, num_frames_saved))
-                    # image_semseg.save_to_disk('%s/seg/%08d' % (args.logdir, num_frames_saved))
-                    num_frames_saved +=1
-                    print('Frames Saved: %d of %d' % (num_frames_saved, max_frames))
+                if vel_ego.x**2 + vel_ego.y**2 < vel_thresh:
+                    print('Waiting for ego to move.', file=sys.stderr)
+                else:
 
-                fps = round(1.0 / snapshot.timestamp.delta_seconds)
-
-                
-                # Write world snapshot to json.
-                snapshot_dict = process_world_snapshot(snapshot, world)
-
-                if num_frames_saved == 1:
-                    with open('snapshot_example.json', 'w') as f:
+                    # Write world snapshot to json.
+                    snapshot_dict = process_world_snapshot(snapshot, world)
+                    json_name = '%s/snapshot/%08d.json' % (args.logdir, num_frames_saved)
+                    with open(json_name, 'w') as f:
                         f.write(json.dumps(snapshot_dict, indent=4))
 
-                # Process collecting images.  Visualization for debugging.
-                mosaic_array = np.zeros((1080, 1920, 3), dtype=np.uint8)
-                for col_idx, camera_id in  enumerate(['center', 'left', 'right', 'far']):
-                    for row_idx, suffix in enumerate(['', 'seg', 'depth']):
-                        img_name = 'image' + '_' + camera_id
+                    # Process collecting images.  Visualization for debugging.
+                    mosaic_array = np.zeros((540, 960, 3), dtype=np.uint8)
+                    for col_idx, camera_id in  enumerate(['center', 'left', 'right', 'far']):
+                        for row_idx, camera_type in enumerate(['rgb', 'seg', 'depth']):
+                            img_name = 'image_' + camera_type + '_' + camera_id
+                            img = locals()[img_name]
 
-                        if len(suffix) > 0:
-                            img_name += '_' + suffix
+                            savedir = args.logdir + '/' + camera_type + '_' + camera_id + '/'
+                            # img.save_to_disk('%s/%08d' % (savedir, num_frames_saved))                            
+                            images_queue.put([img, '%s/%08d' % (savedir, num_frames_saved)])                            
 
-                        img = locals()[img_name]
+                            """
+                            # Issue: converting the img adjust img in the queue too.
+                            # Image is not "deepcopy"-able as well.  
+                            # So just view or save one at a time for now.
+                            if camera_type == 'seg':
+                                img.convert(carla.ColorConverter.CityScapesPalette)
+                            elif camera_type == 'depth':
+                                img.convert(carla.ColorConverter.LogarithmicDepth)
 
-                        if suffix == 'seg':
-                            img.convert(carla.ColorConverter.CityScapesPalette)
-                        elif suffix == 'depth':
-                            img.convert(carla.ColorConverter.LogarithmicDepth)
+                            img_array = np.frombuffer(img.raw_data, dtype=np.uint8)
+                            img_array = np.reshape(img_array, (img.height, img.width, 4))
+                            img_array = img_array[:, :, :3]
 
-                        img_array = np.frombuffer(img.raw_data, dtype=np.uint8)
-                        img_array = np.reshape(img_array, (img.height, img.width, 4))
-                        img_array = img_array[:, :, :3]
+                            if camera_type == 'rgb':
+                                img_array = cv2.resize(img_array, (240, 180), cv2.INTER_CUBIC)
+                            elif camera_type == 'seg' or camera_type == 'depth':
+                                img_array = cv2.resize(img_array, (240, 180), cv2.INTER_NEAREST)
+                            else:
+                                raise ValueError("Unhandled image type: %s" % camera_type)
 
-                        if suffix == '':
-                            img_array = cv2.resize(img_array, (480, 360), cv2.INTER_CUBIC)
-                        elif suffix == 'seg':
-                            img_array = cv2.resize(img_array, (480, 360), cv2.INTER_NEAREST)
-                        elif suffix == 'depth':
-                            img_array = cv2.resize(img_array, (480, 360), cv2.INTER_NEAREST)
-                        else:
-                            raise ValueError("Unhandled image type: %s" % suffix)
+                            xmin = col_idx * 240
+                            xmax = (col_idx + 1) * 240
+                            ymin = row_idx * 180
+                            ymax = (row_idx + 1) * 180
 
-                        xmin = col_idx * 480
-                        xmax = (col_idx + 1) * 480
-                        ymin = row_idx * 360
-                        ymax = (row_idx + 1) * 360
+                            mosaic_array[ymin:ymax, xmin:xmax, :] = img_array
+                            """
+                    
+                    cv2.imshow('mosaic', mosaic_array)
+                    ret = cv2.waitKey(10)
 
-                        mosaic_array[ymin:ymax, xmin:xmax, :] = img_array
-
-                cv2.imshow('mosaic', mosaic_array)
-                ret = cv2.waitKey(10)
+                    num_frames_saved +=1
+                    fps = round(1.0 / snapshot.timestamp.delta_seconds)
+                    print('Frames Saved: %d of %d, fps: %.1f, QSize: %d' % (num_frames_saved, max_frames, fps, images_queue.qsize()), file=sys.stderr)
+                    time.sleep(0.1)
 
                 if num_frames_saved >= max_frames or ret == 27: # Esc
                     return                
@@ -167,6 +190,8 @@ def main_autopilot(args, max_frames=1000):
         print(e)
 
     finally:
+        print('Waiting for all images to be saved.')
+        images_queue.join()        
 
         print('destroying actors.')
         for actor in actor_list:
